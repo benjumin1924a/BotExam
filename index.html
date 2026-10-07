@@ -41,6 +41,18 @@
     .note-input:focus { border-color:#8ba2b6; outline:0; background:#fff; }
     .note-actions { display:flex; gap:7px; margin-top:7px; }
     .note-actions button { padding:4px 9px; font-size:.9rem; }
+    .notes-transfer-panel { margin-top:12px; padding:16px; border:1px solid #aebdcb; background:#f7fafc; }
+    .notes-transfer-panel h2 { margin:0 0 5px; font-size:1.15rem; }
+    .notes-transfer-panel p { margin:5px 0 12px; }
+    .notes-transfer-heading, .notes-transfer-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .notes-transfer-heading { justify-content:space-between; }
+    .notes-transfer-actions button { min-height:40px; }
+    .notes-file-label { display:inline-block; border:1px solid #777; border-radius:3px; padding:8px 10px; background:#fff; cursor:pointer; }
+    .notes-file-label input { display:none; }
+    .notes-import-preview { margin-top:14px; padding:12px; border:1px solid #aebdcb; background:#fff; }
+    .notes-import-preview h3 { margin:0 0 8px; font-size:1rem; overflow-wrap:anywhere; }
+    .notes-import-warning, #notes-transfer-message.error { color:#a51d1d; }
+    #notes-transfer-message { min-height:1.4em; color:#12562d; }
     tr.is-correct td.correction { background:var(--good); }
     tr.is-correct .correct-answer { color:#08742d; }
     tr.is-wrong td.correction { background:var(--bad); }
@@ -100,8 +112,15 @@
       </div>
       <button id="correct-visible">改正目前顯示題目</button>
       <button id="reset" class="secondary">重設作答</button>
+      <button id="toggle-notes-transfer" class="secondary" type="button" aria-expanded="false" aria-controls="notes-transfer-panel">筆記匯出／匯入</button>
       <span id="count"></span>
       <span id="result-summary" aria-live="polite"></span>
+    </section>
+    <section id="notes-transfer-panel" class="notes-transfer-panel" aria-label="筆記匯出與匯入" hidden>
+      <div class="notes-transfer-heading"><div><h2>筆記備份與還原</h2><p>只處理已按「儲存」的筆記；不影響作答。TXT 僅供閱讀，還原請使用 CSV。</p></div><button id="close-notes-transfer" class="secondary" type="button">關閉</button></div>
+      <div class="notes-transfer-actions"><button id="export-notes-csv" type="button">匯出 CSV（可還原）</button><button id="export-notes-txt" class="secondary" type="button">匯出 TXT（閱讀用）</button><label class="notes-file-label">選擇 CSV 匯入<input id="import-notes-file" type="file" accept=".csv,text/csv"></label></div>
+      <div id="notes-import-preview" class="notes-import-preview" hidden><h3 id="notes-import-file"></h3><p id="notes-import-summary"></p><p id="notes-import-warning" class="notes-import-warning" hidden></p><label id="notes-overwrite-label" hidden><input id="notes-overwrite" type="checkbox"> 覆蓋同題既有筆記（預設保留原筆記）</label><div class="notes-transfer-actions"><button id="confirm-notes-import" type="button">匯入</button><button id="cancel-notes-import" class="secondary" type="button">取消</button></div></div>
+      <p id="notes-transfer-message" role="status" aria-live="polite"></p>
     </section>
     <div class="table-wrap"><table>
       <thead><tr><th>題庫號</th><th>改正</th><th>答案</th><th>題目</th><th>出題依據</th><th>筆記</th></tr></thead>
@@ -207,6 +226,203 @@
       document.querySelector('#result-summary').textContent = `改正結果：答對 ${correct} 題、答錯 ${visibleRows.length - correct} 題（其中 ${unanswered} 題未作答，已計入答錯）。`;
     });
     document.querySelector('#reset').addEventListener('click', () => { document.querySelectorAll('#questions input').forEach(input => input.checked = false); document.querySelectorAll('#questions tr').forEach(row => { row.classList.remove('is-correct','is-wrong','is-unanswered'); row.querySelector('.correct-answer').hidden = true; }); document.querySelector('#result-summary').textContent = ''; });
+    // This source is embedded in index.html by build_quiz.py for GitHub Pages.
+    const notesTransferPanel = document.querySelector('#notes-transfer-panel');
+    const notesTransferPreview = document.querySelector('#notes-import-preview');
+    const notesTransferMessage = document.querySelector('#notes-transfer-message');
+    const notesOverwrite = document.querySelector('#notes-overwrite');
+    const notesFileInput = document.querySelector('#import-notes-file');
+    const validNoteIds = new Set(topics.flatMap(topic => topic.questions.map(q => `${topic.id}:${q.number}`)));
+    const maxNotesFileBytes = 8 * 1024 * 1024;
+    let pendingNotesImport = null;
+
+    function notesStatus(message, isError = false) {
+      notesTransferMessage.textContent = message;
+      notesTransferMessage.classList.toggle('error', isError);
+    }
+    function setNotesTransferOpen(open) {
+      notesTransferPanel.hidden = !open;
+      document.querySelector('#toggle-notes-transfer').setAttribute('aria-expanded', String(open));
+      if (!open) cancelNotesImport();
+    }
+    function storedNotes() {
+      const notes = [];
+      for (const topic of topics) for (const q of topic.questions) {
+        const content = localStorage.getItem(noteKey(topic.id, q.number));
+        if (content && content.trim()) notes.push({ topicId: topic.id, questionNumber: q.number, content });
+      }
+      return notes;
+    }
+    function csvCell(value) {
+      const raw = String(value);
+      const safe = /^[\s\u0000-\u001f]*[=+\-@]/u.test(raw) ? `\t${raw}` : raw;
+      return `"${safe.replaceAll('"', '""')}"`;
+    }
+    function notesToCsv(notes) {
+      return '\uFEFF' + ['topic_id,question_number,content', ...notes.map(note =>
+        [note.topicId, note.questionNumber, note.content].map(csvCell).join(','))].join('\r\n') + '\r\n';
+    }
+    function notesToTxt(notes) {
+      const titles = new Map(topics.map(topic => [topic.id, topic.title]));
+      return ['115 年題庫筆記', '', ...notes.flatMap(note => [
+        `${titles.get(note.topicId)}・第 ${note.questionNumber} 題`, note.content, ''
+      ])].join('\n');
+    }
+    function readCsvRows(text) {
+      const rows = [];
+      let row = [], value = '', quoted = false, closedQuote = false;
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        if (quoted) {
+          if (char === '"' && text[i + 1] === '"') { value += '"'; i++; }
+          else if (char === '"') { quoted = false; closedQuote = true; }
+          else value += char;
+          continue;
+        }
+        if (char === '"' && value === '' && !closedQuote) { quoted = true; continue; }
+        if (char === ',' || char === '\n' || char === '\r') {
+          row.push(value); value = ''; closedQuote = false;
+          if (char !== ',') {
+            if (row.some(cell => cell !== '')) rows.push(row);
+            row = [];
+            if (char === '\r' && text[i + 1] === '\n') i++;
+          }
+        } else if (closedQuote || char === '"') {
+          throw new Error('CSV 格式有誤，請使用網站匯出的檔案。');
+        } else value += char;
+      }
+      if (quoted) throw new Error('CSV 引號未結束，請檢查檔案內容。');
+      if (value !== '' || row.length) {
+        row.push(value);
+        if (row.some(cell => cell !== '')) rows.push(row);
+      }
+      return rows;
+    }
+    function parseNotesCsv(text) {
+      const rows = readCsvRows(text.replace(/^\uFEFF/, ''));
+      if (!rows.length || rows[0].length !== 3 ||
+          rows[0][0] !== 'topic_id' || rows[0][1] !== 'question_number' || rows[0][2] !== 'content') {
+        throw new Error('欄位不符；請選擇網站匯出的 CSV 筆記檔。');
+      }
+      if (rows.length - 1 > validNoteIds.size) throw new Error('匯入筆記筆數超過題庫總題數。');
+      const entries = [], invalidRows = [], seen = new Set();
+      for (const [index, row] of rows.slice(1).entries()) {
+        const topicId = Number(row[0]), questionNumber = Number(row[1]);
+        const content = row[2]?.replace(/^\t(?=[=+\-@])/u, '').trim() ?? '';
+        const id = `${topicId}:${questionNumber}`;
+        if (row.length !== 3 || !Number.isInteger(topicId) || !Number.isInteger(questionNumber) ||
+            !validNoteIds.has(id) || !content || content.length > 10000 || seen.has(id)) {
+          invalidRows.push(`第 ${index + 2} 列`);
+          continue;
+        }
+        seen.add(id);
+        entries.push({ topicId, questionNumber, content });
+      }
+      return { entries, invalidRows };
+    }
+    function downloadNotes(text, extension, mime) {
+      const url = URL.createObjectURL(new Blob([text], { type: mime }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `題庫筆記-${new Date().toISOString().slice(0, 10)}.${extension}`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }
+    function exportNotes(format) {
+      try {
+        const notes = storedNotes();
+        if (!notes.length) { notesStatus('目前沒有已儲存的筆記可匯出。', true); return; }
+        if (format === 'csv') downloadNotes(notesToCsv(notes), 'csv', 'text/csv;charset=utf-8');
+        else downloadNotes(notesToTxt(notes), 'txt', 'text/plain;charset=utf-8');
+        notesStatus(`已匯出 ${notes.length} 筆筆記。`);
+      } catch (error) { notesStatus(`匯出失敗：${error.message}`, true); }
+    }
+    function cancelNotesImport() {
+      pendingNotesImport = null;
+      notesTransferPreview.hidden = true;
+      notesOverwrite.checked = false;
+      notesFileInput.value = '';
+    }
+    function updateNotesPreview() {
+      if (!pendingNotesImport) return;
+      const { added, conflicts, unchanged, invalidRows } = pendingNotesImport;
+      document.querySelector('#notes-import-file').textContent = `匯入預覽：${pendingNotesImport.fileName}`;
+      document.querySelector('#notes-import-summary').textContent =
+        `可新增 ${added} 筆；同題內容不同 ${conflicts} 筆；內容相同 ${unchanged} 筆；無法匯入 ${invalidRows.length} 筆。`;
+      const warning = document.querySelector('#notes-import-warning');
+      warning.hidden = invalidRows.length === 0;
+      warning.textContent = invalidRows.length ? `略過：${invalidRows.slice(0, 5).join('、')}${invalidRows.length > 5 ? '等' : ''}。` : '';
+      document.querySelector('#notes-overwrite-label').hidden = conflicts === 0;
+      const count = added + (notesOverwrite.checked ? conflicts : 0);
+      const confirm = document.querySelector('#confirm-notes-import');
+      confirm.textContent = `匯入 ${count} 筆`;
+      confirm.disabled = count === 0;
+      notesTransferPreview.hidden = false;
+    }
+    async function prepareNotesImport(file) {
+      cancelNotesImport();
+      if (!file) return;
+      if (file.size > maxNotesFileBytes) { notesStatus('CSV 檔案不可超過 8 MB。', true); return; }
+      try {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer());
+        const parsed = parseNotesCsv(text);
+        let added = 0, conflicts = 0, unchanged = 0;
+        for (const note of parsed.entries) {
+          const old = localStorage.getItem(noteKey(note.topicId, note.questionNumber));
+          if (old === null || old === '') added++;
+          else if (old === note.content) unchanged++;
+          else conflicts++;
+        }
+        pendingNotesImport = { ...parsed, fileName: file.name, added, conflicts, unchanged };
+        notesStatus('請先確認匯入預覽，再按下「匯入」。');
+        updateNotesPreview();
+      } catch (error) { notesStatus(`無法讀取 CSV：${error.message}`, true); }
+    }
+    function importNotes() {
+      if (!pendingNotesImport) return;
+      const overwrite = notesOverwrite.checked;
+      if (overwrite && pendingNotesImport.conflicts &&
+          !confirm(`確定匯入筆記，並覆蓋 ${pendingNotesImport.conflicts} 筆同題既有筆記？`)) return;
+      const changes = [];
+      try {
+        for (const note of pendingNotesImport.entries) {
+          const key = noteKey(note.topicId, note.questionNumber);
+          const old = localStorage.getItem(key);
+          if (old === note.content || (old !== null && old !== '' && !overwrite)) continue;
+          changes.push({ key, old, content: note.content });
+        }
+        const written = [];
+        try {
+          for (const change of changes) { localStorage.setItem(change.key, change.content); written.push(change); }
+        } catch (error) {
+          let restored = true;
+          for (const change of written.reverse()) {
+            try { if (change.old === null) localStorage.removeItem(change.key); else localStorage.setItem(change.key, change.old); }
+            catch { restored = false; }
+          }
+          throw new Error(restored ? '儲存空間不足或無法存取；原有筆記已保留。' : '儲存失敗，部分筆記可能已變更，請檢查後再匯入。');
+        }
+        const changedByKey = new Map(changes.map(change => [change.key, change.content]));
+        document.querySelectorAll('.note-input').forEach(input => {
+          const value = changedByKey.get(noteKey(input.dataset.noteTopic, input.dataset.noteNumber));
+          if (value !== undefined) input.value = value;
+        });
+        const skipped = pendingNotesImport.conflicts - (overwrite ? pendingNotesImport.conflicts : 0);
+        notesStatus(`匯入完成：新增 ${pendingNotesImport.added} 筆、覆蓋 ${overwrite ? pendingNotesImport.conflicts : 0} 筆；保留原筆記 ${skipped} 筆。`);
+        cancelNotesImport();
+      } catch (error) { notesStatus(`匯入失敗：${error.message}`, true); }
+    }
+    document.querySelector('#toggle-notes-transfer').addEventListener('click', () => setNotesTransferOpen(notesTransferPanel.hidden));
+    document.querySelector('#close-notes-transfer').addEventListener('click', () => setNotesTransferOpen(false));
+    document.querySelector('#export-notes-csv').addEventListener('click', () => exportNotes('csv'));
+    document.querySelector('#export-notes-txt').addEventListener('click', () => exportNotes('txt'));
+    notesFileInput.addEventListener('change', () => prepareNotesImport(notesFileInput.files[0]));
+    notesOverwrite.addEventListener('change', updateNotesPreview);
+    document.querySelector('#confirm-notes-import').addEventListener('click', importNotes);
+    document.querySelector('#cancel-notes-import').addEventListener('click', cancelNotesImport);
+
     render();
   </script>
 </body>
